@@ -247,6 +247,20 @@ class MultiCameraTracker:
         for track in tracker.tracks.values():
             track.time_since_update += 1
 
+    def collect_tracking_info(self): # 트래킹 과정에서 ui에 보내줘야 할 정보들
+        tracking_info = []
+        for camera_id, tracker in self.camera_trackers.items():
+            for track_id, track in tracker.tracks.items():
+                if track.state == 'confirmed':  # 확인된 트래킹만 수집
+                    info = {
+                        'camera_id': camera_id,
+                        'global_id': tracker.get_track_id(track_id),
+                        'bbox': track.bbox,
+                        'frame_number': self.frame_count  # 현재 프레임 번호
+                    }
+                    tracking_info.append(info)
+        return tracking_info
+
     def visualize_results(self, frames):
         """결과 시각화"""
         num_cameras = len(frames)
