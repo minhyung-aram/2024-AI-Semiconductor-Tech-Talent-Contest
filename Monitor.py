@@ -1,18 +1,32 @@
 import cv2
 import numpy as np
 import mmap
+import ffmpeg
+import threading
+import signal
+import time
+import logging
 
-# 공유 메모리 크기 (RGBA 이미지의 크기: 1280 * 720 * 4바이트 * 4개 카메라)
-image_width = 1280
-image_height = 720
+logging.basicConfig(level=logging.DEBUG)
+image_width = 1024
+image_height = 576
 bytes_per_pixel = 4  # RGBA 형식이므로 4바이트
-shared_memory_size = image_width * image_height * bytes_per_pixel * 4  # 4개의 카메라 데이터 포함
+shared_memory_size = image_width * image_height * bytes_per_pixel  # 4개의 카메라 데이터 포함
 
+rtmp_url = "rtmp://14.39.59.81/live/"
+frame_rate = 30
+fourcc = cv2.VideoWriter_fourcc(*'X264')
+
+running = True
+def signal_handler(sig, frame):
+    global running
+    running = False
+
+signal.signal(signal.SIGINT, signal_handler)
+lock = threading.Lock()
 # 공유 메모리에서 데이터를 읽어오는 함수 (offset 기반)
-def read_from_shared_memory(memory_name, offset, size):
-    # Windows에서 태그 기반으로 메모리 매핑
+def read_from_shared_memory(memory_name, size):
     mm = mmap.mmap(0, shared_memory_size, tagname=memory_name)
-    mm.seek(offset)  # 지정된 offset 위치로 이동
     image_data = mm.read(size)  # 지정된 크기만큼 데이터 읽기
     mm.close()
     
@@ -24,37 +38,72 @@ def read_from_shared_memory(memory_name, offset, size):
     
     return image_np
 
-# 네 개의 카메라 영상을 합쳐서 한 화면에 출력하는 함수
-def display_combined_camera_feeds():
-    while True:
-        # 각 카메라 이미지 읽기 (오프셋과 크기를 사용하여 각각의 카메라 데이터 읽기)
-        cam1_image = read_from_shared_memory("CameraSharedMemory", 0, image_width * image_height * bytes_per_pixel)
-        cam2_image = read_from_shared_memory("CameraSharedMemory", image_width * image_height * bytes_per_pixel, image_width * image_height * bytes_per_pixel)
-        cam3_image = read_from_shared_memory("CameraSharedMemory", image_width * image_height * bytes_per_pixel * 2, image_width * image_height * bytes_per_pixel)
-        cam4_image = read_from_shared_memory("CameraSharedMemory", image_width * image_height * bytes_per_pixel * 3, image_width * image_height * bytes_per_pixel)
-        
-        # 각 카메라 이미지를 640x360으로 리사이즈
-        cam1_resized = cv2.resize(cam1_image, (640, 360))
-        cam2_resized = cv2.resize(cam2_image, (640, 360))
-        cam3_resized = cv2.resize(cam3_image, (640, 360))
-        cam4_resized = cv2.resize(cam4_image, (640, 360))
+def increase_brightness(image, value=50):
+    image = np.clip(image + value, 0, 255)
+    return image
 
-        # 상단, 하단 각각 두 개의 영상을 합치기
-        top_row = np.hstack((cam1_resized, cam2_resized))
-        bottom_row = np.hstack((cam3_resized, cam4_resized))
+def camera_stream_worker(camera_id, rtmp_url):
+    attempt = 0  # 스트림 시도 횟수
+    max_attempts = 5  # 최대 재시도 횟수
+    while attempt < max_attempts:
+        try:
+            # 스트리밍을 위한 ffmpeg 프로세스 시작
+            process = (
+                ffmpeg
+                .input("pipe:0", framerate=30, format="rawvideo", pix_fmt="bgr24", s="360x288")
+                .output(rtmp_url, format="flv", vcodec="libx264", preset="fast", crf=28, video_bitrate=1000)
+                .run_async(pipe_stdin=True)
+            )#여기서 s에 들어가는 문자열에 영상 사이즈로 바꿔야함
+            
+            mmname = f"CameraSharedMemory_{camera_id}"
+            logging.debug(f"Starting stream for {mmname} to {rtmp_url}")
 
-        # 상단과 하단을 세로로 합쳐서 전체 화면 구성
-        combined_image = np.vstack((top_row, bottom_row))
+            #cap = cv2.VideoCapture(rf"C:\Users\ykh45\cam{camera_id+1}.avi")=====================================
+            while running:
+                # 공유 메모리에서 이미지 데이터 읽기
+                with lock:
+                    image = read_from_shared_memory(mmname, image_width * image_height * bytes_per_pixel)
+                    bright_image = increase_brightness(image)  # 밝기 증가 (구현 필요)
 
-        # 결합된 화면 출력
-        cv2.imshow('Combined Camera Feeds', combined_image)
+                # 비디오 파일에서 한 프레임 읽기====================
+                #_, bright_image = cap.read()================================
+                # if not _:==================================
+                #     logging.warning(f"Failed to read frame from camera {camera_id}, retrying...")=============================
+                #     break  # 프레임 읽기 실패 시 스트림을 중단하고 재시도==============================
 
-        # 'q' 키를 누르면 종료
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+                process.stdin.write(bright_image.tobytes())  # 이미지 데이터를 스트리밍
+                time.sleep(0.03)
+            
+            process.stdin.close()
+            process.wait()
 
-    cv2.destroyAllWindows()
+            # 성공적으로 스트리밍을 마쳤다면, 반복문을 종료
+            logging.debug(f"Successfully streamed from camera {camera_id}")
+            break  # 스트리밍 성공 후 루프 탈출
 
-# 프로그램 실행
+        except Exception as e:
+            # 예외 발생 시 로그 기록 및 재시도
+            logging.error(f"Error with camera {camera_id} streaming: {e}")
+            attempt += 1
+            logging.info(f"Attempt {attempt} of {max_attempts} failed. Retrying in 5 seconds...")
+            time.sleep(0.1)  # 재시도 전 대기
+            if attempt >= max_attempts:
+                logging.error(f"Maximum attempts reached for camera {camera_id}. Giving up.")
+
 if __name__ == "__main__":
-    display_combined_camera_feeds()
+    camera_threads = []
+    rtmp_urls = [f"{rtmp_url}{i:04d}" for i in range(4)] 
+    """=====================================================
+    중요           여기 4가 스트림 할 화면 수임 최대 4개^
+    ======================================================
+    위에 동작부 중에 ===========붙은 부분은 저장된 영상으로 테스트 하는 용도임 시뮬레이터로 할거면 제거
+    시뮬레이터와 공유 메모리로 주고 받는건 윈도우에서만 됨
+    """
+    for i in range(4):
+        t = threading.Thread(target=camera_stream_worker, args=(i, rtmp_urls[i]))
+        t.start()
+        time.sleep(0.1)
+        camera_threads.append(t)
+
+    for t in camera_threads:
+        t.join()
